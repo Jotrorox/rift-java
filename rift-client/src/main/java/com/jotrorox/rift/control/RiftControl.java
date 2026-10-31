@@ -12,6 +12,7 @@ import com.jotrorox.rift.RiftException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
@@ -114,6 +115,19 @@ public final class RiftControl {
      */
     public JsonElement reload() throws IOException {
         return execute("reload", new JsonObject());
+    }
+
+    /**
+     * Hosts running {@code rift node} for this proxy, with reachability,
+     * labels and capacity. Requires Rift with multi-host support.
+     */
+    public List<NodeStatus> nodes() throws IOException {
+        return NodeStatus.parseAll(execute("nodes", new JsonObject()));
+    }
+
+    /** {@link #nodes()} on a background thread. */
+    public CompletableFuture<List<NodeStatus>> nodesAsync() {
+        return executeAsync("nodes", new JsonObject()).thenApply(NodeStatus::parseAll);
     }
 
     /** {@link #status()} on a background thread. */
