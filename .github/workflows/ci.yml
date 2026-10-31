@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and test (Java ${{ matrix.java }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21', '25']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Download the latest Rift nightly for integration tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list -R Jotrorox/rift -L 1 --json tagName -q '.[0].tagName')
+          mkdir -p "$RUNNER_TEMP/rift"
+          gh release download "$tag" -R Jotrorox/rift -p rift-linux-x86_64 -D "$RUNNER_TEMP/rift"
+          chmod +x "$RUNNER_TEMP/rift/rift-linux-x86_64"
+          echo "RIFT_BINARY=$RUNNER_TEMP/rift/rift-linux-x86_64" >> "$GITHUB_ENV"
+          echo "Testing against Rift $tag"
+      - run: ./gradlew build --no-daemon
+      - name: Fail if integration tests were skipped
+        run: |
+          report=rift-client/build/test-results/test/TEST-com.jotrorox.rift.RiftIntegrationTest.xml
+          if [ ! -f "$report" ] || grep -q '<skipped' "$report"; then
+            echo "Integration tests did not run" >&2
+            exit 1
+          fi
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-java-${{ matrix.java }}
+          path: '*/build/reports/tests/'
