@@ -4,6 +4,7 @@ import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicStream;
 
 import javax.net.ssl.X509TrustManager;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -88,7 +89,7 @@ public final class QuicTransport implements Transport {
     @Override
     public Channel open() throws IOException {
         QuicStream stream = connection.createStream(true);
-        return new QuicChannel(stream);
+        return new QuicChannel(stream, new SendStream(stream.getOutputStream()));
     }
 
     @Override
@@ -120,15 +121,10 @@ public final class QuicTransport implements Transport {
         }
     }
 
-    private record QuicChannel(QuicStream stream) implements Channel {
+    private record QuicChannel(QuicStream stream, OutputStream output) implements Channel {
         @Override
         public InputStream input() {
             return stream.getInputStream();
-        }
-
-        @Override
-        public OutputStream output() {
-            return stream.getOutputStream();
         }
 
         @Override
@@ -152,6 +148,26 @@ public final class QuicTransport implements Transport {
             } catch (RuntimeException ignored) {
                 // Already fully read.
             }
+        }
+    }
+
+    /**
+     * Kwik sends written data right away and its {@code flush} only checks the stream state. Rift stops
+     * reading a request stream once it has the whole request, so a STOP_SENDING arriving between a write
+     * and its flush would fail a request the server already answered. A reset still fails the next write.
+     */
+    private static final class SendStream extends FilterOutputStream {
+        private SendStream(OutputStream out) {
+            super(out);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            out.write(b, off, len);
+        }
+
+        @Override
+        public void flush() {
         }
     }
 }
