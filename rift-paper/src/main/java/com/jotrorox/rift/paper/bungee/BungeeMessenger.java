@@ -9,6 +9,7 @@ import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
@@ -20,9 +21,12 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 /**
@@ -33,7 +37,9 @@ import java.util.function.BiConsumer;
  * <p>Rift sends no reply for missing players or servers, so queries complete
  * exceptionally with a {@link java.util.concurrent.TimeoutException} after the
  * configured timeout. Queries without a carrier fail with
- * {@link NoCarrierException}.
+ * {@link NoCarrierException}. Rift's own requests, {@link #riftServers} and
+ * {@link #inGroup}, also time out behind Velocity or BungeeCord, which ignore
+ * them; {@link #isRift} tells the two apart quickly.
  *
  * @param <P> the carrier type, such as a Paper {@code Player}
  */
@@ -48,12 +54,16 @@ public class BungeeMessenger<P> {
     public static final int MAX_MESSAGE_BYTES = 32_767;
 
     private static final Set<String> REPLY_SUBCHANNELS = Set.of("IP", "IPOther", "PlayerCount", "PlayerList",
-            "GetServers", "GetServer", "GetPlayerServer", "UUID", "UUIDOther", "ServerIP");
+            "GetServers", "GetServer", "GetPlayerServer", "UUID", "UUIDOther", "ServerIP", "RiftServers",
+            "RiftInGroup");
+    /** The longest {@link #isRift} waits for an answer. */
+    private static final Duration RIFT_PROBE_TIMEOUT = Duration.ofSeconds(1);
 
     private final Carriers<P> carriers;
     private final Map<String, Deque<CompletableFuture<Object>>> pending = new HashMap<>();
     private final Map<String, List<BiConsumer<P, byte[]>>> forwardListeners = new ConcurrentHashMap<>();
     private volatile Duration timeout = Duration.ofSeconds(5);
+    private final AtomicReference<CompletableFuture<Boolean>> riftProbe = new AtomicReference<>();
 
     /** Access to the server's online players. */
     public interface Carriers<P> {
@@ -143,6 +153,78 @@ public class BungeeMessenger<P> {
     /** The configured address of {@code server}; hostnames are returned unresolved. */
     public CompletableFuture<InetSocketAddress> serverAddress(String server) {
         return query("ServerIP|" + key(server), encode("ServerIP", server));
+    }
+
+    /**
+     * The running servers selected by {@code target}, sorted by name. Servers
+     * that are stopped, starting or failed health checks are left out; a
+     * service group without running instances yields an empty list.
+     *
+     * <p>The query times out with a {@link java.util.concurrent.TimeoutException}
+     * for an unknown target and behind proxies other than Rift.
+     *
+     * @param target a server name, a service group name or {@link #ALL}; names ignore case
+     */
+    public CompletableFuture<List<RiftServer>> riftServers(String target) {
+        return query("RiftServers|" + serverKey(target), encode("RiftServers", target));
+    }
+
+    /**
+     * Whether the named player belongs to the permission group {@code group}
+     * defined in Rift's {@code extensions.groups}, directly, through inheritance
+     * or through {@code default}. Undefined groups answer {@code false}.
+     *
+     * <p>The query times out with a {@link java.util.concurrent.TimeoutException}
+     * for a player who is not online, when Rift runs without extensions using
+     * {@code api_version = 2}, and behind proxies other than Rift.
+     *
+     * @param playerName the player's name; it ignores case
+     * @param group the group's name, compared exactly
+     */
+    public CompletableFuture<Boolean> inGroup(String playerName, String group) {
+        return query(inGroupKey(playerName, group), encode("RiftInGroup", playerName, group));
+    }
+
+    /**
+     * Whether this server runs behind Rift with its BungeeCord channel enabled.
+     * Sends {@code RiftServers ALL} and waits at most one second (or the
+     * {@linkplain #timeout(Duration) query timeout}, if shorter), so plugins can
+     * fall back to plain BungeeCord behavior without waiting for a full timeout.
+     *
+     * <p>The answer is cached for the lifetime of this messenger, and concurrent
+     * calls share one request. It fails with {@link NoCarrierException} while no
+     * player is online; failures are not cached.
+     */
+    public CompletableFuture<Boolean> isRift() {
+        while (true) {
+            CompletableFuture<Boolean> current = riftProbe.get();
+            if (current != null && !current.isCompletedExceptionally()) {
+                return current;
+            }
+            CompletableFuture<Boolean> probe = new CompletableFuture<>();
+            if (!riftProbe.compareAndSet(current, probe)) {
+                continue;
+            }
+            Duration wait = timeout.compareTo(RIFT_PROBE_TIMEOUT) < 0 ? timeout : RIFT_PROBE_TIMEOUT;
+            Optional<P> carrier = carriers.any();
+            if (carrier.isEmpty()) {
+                probe.completeExceptionally(new NoCarrierException());
+                return probe;
+            }
+            query(carrier.get(), "RiftServers|" + ALL, encode("RiftServers", ALL), wait)
+                    .whenComplete((servers, error) -> {
+                        Throwable cause = error instanceof CompletionException && error.getCause() != null
+                                ? error.getCause() : error;
+                        if (cause == null) {
+                            probe.complete(true);
+                        } else if (cause instanceof TimeoutException) {
+                            probe.complete(false);
+                        } else {
+                            probe.completeExceptionally(cause);
+                        }
+                    });
+            return probe;
+        }
     }
 
     /**
@@ -249,6 +331,24 @@ public class BungeeMessenger<P> {
                 String name = in.readUTF();
                 return complete("UUIDOther|" + key(name), parseUuid(in.readUTF()));
             }
+            case "RiftServers" -> {
+                String target = in.readUTF();
+                int count = in.readInt();
+                if (count < 0) {
+                    throw new IOException("negative server count");
+                }
+                List<RiftServer> servers = new ArrayList<>();
+                for (int i = 0; i < count; i++) {
+                    servers.add(new RiftServer(in.readUTF(), in.readUTF(), RiftServer.State.parse(in.readUTF()),
+                            in.readInt(), in.readInt()));
+                }
+                return complete("RiftServers|" + serverKey(target), List.copyOf(servers));
+            }
+            case "RiftInGroup" -> {
+                String name = in.readUTF();
+                String group = in.readUTF();
+                return complete(inGroupKey(name, group), in.readBoolean());
+            }
             case "ServerIP" -> {
                 String server = in.readUTF();
                 String host = in.readUTF();
@@ -269,13 +369,17 @@ public class BungeeMessenger<P> {
         return query(carrier.get(), key, message);
     }
 
-    @SuppressWarnings("unchecked")
     private <T> CompletableFuture<T> query(P carrier, String key, byte[] message) {
+        return query(carrier, key, message, timeout);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> CompletableFuture<T> query(P carrier, String key, byte[] message, Duration wait) {
         CompletableFuture<Object> future = new CompletableFuture<>();
         synchronized (pending) {
             pending.computeIfAbsent(key, ignored -> new ArrayDeque<>()).add(future);
         }
-        future.orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
+        future.orTimeout(wait.toMillis(), TimeUnit.MILLISECONDS)
                 .whenComplete((value, error) -> forget(key, future));
         try {
             carriers.send(carrier, message);
@@ -384,6 +488,11 @@ public class BungeeMessenger<P> {
     private static String serverKey(String server) {
         // ALL must be uppercase; server names ignore ASCII case.
         return server.equals(ALL) ? ALL : "server:" + key(server);
+    }
+
+    private static String inGroupKey(String playerName, String group) {
+        // Rift matches player names ignoring case but repeats the group exactly as sent.
+        return "RiftInGroup|" + key(playerName) + "|" + group;
     }
 
     private static byte[] checkSize(byte[] message) {
