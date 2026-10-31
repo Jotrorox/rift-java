@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -24,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -168,6 +170,134 @@ class BungeeMessengerTest {
         messenger.receive("Steve", utf("PlayerCount", "lobby", 2));
         assertEquals(1, first.get(1, TimeUnit.SECONDS));
         assertEquals(2, second.get(1, TimeUnit.SECONDS));
+    }
+
+    /** A {@code RiftServers} reply; each entry is name, group, state, players and limit. */
+    private static byte[] riftServers(String target, Object[]... entries) throws IOException {
+        List<Object> fields = new ArrayList<>(List.of("RiftServers", target, entries.length));
+        for (Object[] entry : entries) {
+            fields.addAll(List.of(entry));
+        }
+        return utf(fields.toArray());
+    }
+
+    private static byte[] inGroupReply(String player, String group, boolean member) throws IOException {
+        return utf("RiftInGroup", player, group, new byte[] {(byte) (member ? 1 : 0)});
+    }
+
+    @Test
+    void listsRiftServers() throws Exception {
+        CompletableFuture<List<RiftServer>> all = messenger.riftServers(BungeeMessenger.ALL);
+        assertEquals(List.of("RiftServers", "ALL"), lastStrings(2));
+        CompletableFuture<List<RiftServer>> lobby = messenger.riftServers("lobby");
+        assertEquals(List.of("RiftServers", "lobby"), lastStrings(2));
+
+        messenger.receive("Steve", riftServers("ALL",
+                new Object[] {"Lobby", "", "running", 1, 50},
+                new Object[] {"game-1", "game", "draining", 4, 0}));
+        // Rift repeats the configured name, which may differ in case from the request.
+        messenger.receive("Steve", riftServers("Lobby", new Object[] {"Lobby", "", "running", 1, 50}));
+
+        RiftServer lobbyServer = new RiftServer("Lobby", "", RiftServer.State.RUNNING, 1, 50);
+        assertEquals(List.of(lobbyServer, new RiftServer("game-1", "game", RiftServer.State.DRAINING, 4, 0)),
+                all.get(1, TimeUnit.SECONDS));
+        assertEquals(List.of(lobbyServer), lobby.get(1, TimeUnit.SECONDS));
+
+        assertTrue(lobbyServer.acceptsPlayers());
+        assertEquals(OptionalInt.of(50), lobbyServer.limit());
+        RiftServer game = all.get().get(1);
+        assertFalse(game.acceptsPlayers());
+        assertEquals(OptionalInt.empty(), game.limit());
+    }
+
+    @Test
+    void riftServersForAnEmptyGroupIsAnEmptyList() throws Exception {
+        CompletableFuture<List<RiftServer>> game = messenger.riftServers("GAME");
+        messenger.receive("Steve", riftServers("game"));
+        assertEquals(List.of(), game.get(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void unknownServerStatesAcceptNoPlayers() throws Exception {
+        CompletableFuture<List<RiftServer>> servers = messenger.riftServers("lobby");
+        messenger.receive("Steve", riftServers("lobby", new Object[] {"lobby", "", "warming", 0, 0}));
+        RiftServer server = servers.get(1, TimeUnit.SECONDS).getFirst();
+        assertEquals(RiftServer.State.DRAINING, server.state());
+        assertFalse(server.acceptsPlayers());
+    }
+
+    @Test
+    void ignoresMalformedRiftServersReplies() {
+        CompletableFuture<List<RiftServer>> servers = messenger.riftServers("lobby");
+        assertDoesNotFail(() -> messenger.receive("Steve", utf("RiftServers", "lobby", -1)));
+        assertDoesNotFail(() -> messenger.receive("Steve", utf("RiftServers", "lobby", 2, "lobby", "")));
+        assertFalse(servers.isDone());
+    }
+
+    @Test
+    void repeatedRiftServersQueriesCompleteInOrder() throws Exception {
+        CompletableFuture<List<RiftServer>> first = messenger.riftServers("lobby");
+        CompletableFuture<List<RiftServer>> second = messenger.riftServers("Lobby");
+        messenger.receive("Steve", riftServers("Lobby", new Object[] {"Lobby", "", "running", 1, 0}));
+        messenger.receive("Steve", riftServers("Lobby", new Object[] {"Lobby", "", "running", 2, 0}));
+        assertEquals(1, first.get(1, TimeUnit.SECONDS).getFirst().players());
+        assertEquals(2, second.get(1, TimeUnit.SECONDS).getFirst().players());
+    }
+
+    @Test
+    void answersInGroupQueries() throws Exception {
+        CompletableFuture<Boolean> staff = messenger.inGroup("alice", "staff");
+        assertEquals(List.of("RiftInGroup", "alice", "staff"), lastStrings(3));
+        CompletableFuture<Boolean> upperStaff = messenger.inGroup("alice", "Staff");
+
+        // The player name ignores case, the group must match exactly.
+        messenger.receive("Steve", inGroupReply("Alice", "staff", true));
+        assertTrue(staff.get(1, TimeUnit.SECONDS));
+        assertFalse(upperStaff.isDone());
+        messenger.receive("Steve", inGroupReply("Alice", "Staff", false));
+        assertFalse(upperStaff.get(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void repeatedInGroupQueriesCompleteInOrder() throws Exception {
+        CompletableFuture<Boolean> first = messenger.inGroup("Alice", "vip");
+        CompletableFuture<Boolean> second = messenger.inGroup("ALICE", "vip");
+        messenger.receive("Steve", inGroupReply("Alice", "vip", false));
+        messenger.receive("Steve", inGroupReply("Alice", "vip", true));
+        assertFalse(first.get(1, TimeUnit.SECONDS));
+        assertTrue(second.get(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void detectsRiftAndCachesTheAnswer() throws Exception {
+        CompletableFuture<Boolean> rift = messenger.isRift();
+        assertEquals(List.of("RiftServers", "ALL"), lastStrings(2));
+        assertSame(rift, messenger.isRift());
+        messenger.receive("Steve", riftServers("ALL"));
+        assertTrue(rift.get(1, TimeUnit.SECONDS));
+        int requests = sent.size();
+        assertTrue(messenger.isRift().get(1, TimeUnit.SECONDS));
+        assertEquals(requests, sent.size());
+    }
+
+    @Test
+    void anUnansweredProbeMeansNoRift() throws Exception {
+        assertFalse(messenger.isRift().get(2, TimeUnit.SECONDS));
+        int requests = sent.size();
+        assertFalse(messenger.isRift().get(1, TimeUnit.SECONDS));
+        assertEquals(requests, sent.size());
+    }
+
+    @Test
+    void probingWithoutACarrierIsRetried() throws Exception {
+        online = null;
+        ExecutionException error = assertThrows(ExecutionException.class,
+                () -> messenger.isRift().get(1, TimeUnit.SECONDS));
+        assertInstanceOf(NoCarrierException.class, error.getCause());
+        online = "Steve";
+        CompletableFuture<Boolean> rift = messenger.isRift();
+        messenger.receive("Steve", riftServers("ALL"));
+        assertTrue(rift.get(1, TimeUnit.SECONDS));
     }
 
     @Test

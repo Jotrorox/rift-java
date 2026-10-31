@@ -151,6 +151,32 @@ with `NoCarrierException`. Rift sends no reply for unknown players or servers,
 so those queries fail with a `TimeoutException` after five seconds (change it
 with `bungee.timeout(...)`). Replies arrive on the server thread.
 
+Rift also answers two requests of its own. `riftServers` lists the running
+servers of a server, service group or `ALL` with their group, state and
+capacity in one reply, and `inGroup` checks a player's permission group:
+
+```java
+bungee.riftServers("lobby").thenAccept(servers -> {
+    for (RiftServer server : servers) {
+        if (server.acceptsPlayers()) { // false while draining
+            String capacity = server.limit().isPresent()
+                    ? server.players() + "/" + server.limit().getAsInt()
+                    : server.players() + " online";
+            menu.add(server.name(), capacity);
+        }
+    }
+});
+bungee.inGroup(player.getName(), "staff").thenAccept(staff -> { /* ... */ });
+```
+
+A service group without running instances gives an empty list. Target names
+ignore case except for `ALL`; group names in `inGroup` must match exactly.
+These requests get no reply, and so fail with a `TimeoutException`, for an
+unknown target, for a player who is not online, for `inGroup` when Rift runs
+without extensions using `api_version = 2`, and behind Velocity or BungeeCord.
+Call `bungee.isRift()` first to choose between Rift and plain BungeeCord
+behavior: it waits at most one second and caches the answer.
+
 ## The client
 
 `rift-client` works on any JVM. Keep one client open instead of reconnecting
