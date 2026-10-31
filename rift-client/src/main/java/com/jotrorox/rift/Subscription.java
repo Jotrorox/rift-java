@@ -106,8 +106,11 @@ public final class Subscription implements AutoCloseable {
     /** Cancels the subscription and discards messages that were not read yet. */
     @Override
     public void close() {
+        // Finish before aborting: otherwise the reader can see the aborted
+        // stream first and end the subscription with an error.
+        boolean first = finish(null);
         channel.abort();
-        if (finish(null)) {
+        if (first) {
             Thread thread = reader;
             if (thread != null && thread != Thread.currentThread()) {
                 thread.interrupt();

@@ -1,6 +1,9 @@
 package com.jotrorox.rift;
 
 import com.jotrorox.rift.control.RiftControl;
+import com.jotrorox.rift.decision.Decision;
+import com.jotrorox.rift.decision.DecisionHandler;
+import com.jotrorox.rift.decision.DecisionRequest;
 import com.jotrorox.rift.internal.Deadlines;
 import com.jotrorox.rift.internal.Frame;
 import com.jotrorox.rift.internal.FrameBuilder;
@@ -27,9 +30,11 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -58,6 +63,10 @@ public final class RiftClient implements AutoCloseable {
     public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(30);
     public static final Duration DEFAULT_OPERATION_TIMEOUT = Duration.ofSeconds(30);
     public static final int DEFAULT_SUBSCRIPTION_BUFFER = 1024;
+    /** The queue group {@link #decide(String, DecisionHandler)} joins. */
+    public static final String DEFAULT_DECIDER_GROUP = "deciders";
+
+    private static final System.Logger LOGGER = System.getLogger(RiftClient.class.getName());
 
     private static final Duration REQUEST_TRANSPORT_GRACE = Duration.ofSeconds(5);
 
@@ -242,6 +251,66 @@ public final class RiftClient implements AutoCloseable {
     /** Runs {@link #request(String, byte[], Duration)} on a background thread. */
     public CompletableFuture<Message> requestAsync(String subject, byte[] payload, Duration timeout) {
         return supplyAsync(() -> request(subject, payload, timeout));
+    }
+
+    /**
+     * Answers the decisions Rift sends on {@code subject}, configured in
+     * Rift's {@code extensions.decisions}. Joins the queue group
+     * {@value #DEFAULT_DECIDER_GROUP}, so several deciders share the load.
+     * Needs subscribe access to {@code subject} and publish access to
+     * {@code _INBOX.>}.
+     *
+     * <pre>{@code
+     * client.decide("relaxoban.login", request -> bans.activeBan(request.uuid())
+     *         .thenApply(ban -> ban.map(b -> Decision.deny(b.message())).orElse(Decision.proceed())));
+     * }</pre>
+     *
+     * @return the subscription; close it to stop answering
+     */
+    public Subscription decide(String subject, DecisionHandler handler) throws IOException {
+        return decide(subject, DEFAULT_DECIDER_GROUP, handler);
+    }
+
+    /**
+     * Answers decisions on {@code subject} within {@code queueGroup}, or as the
+     * only decider with {@code null}. Two deciders outside a shared group both
+     * answer and Rift uses whichever reply arrives first.
+     */
+    public Subscription decide(String subject, String queueGroup, DecisionHandler handler) throws IOException {
+        Subjects.requireLiteral(subject);
+        Objects.requireNonNull(handler, "handler");
+        return subscribe(subject, queueGroup, message -> answer(message, handler));
+    }
+
+    private void answer(Message message, DecisionHandler handler) throws Exception {
+        String reply = message.reply();
+        if (reply == null) {
+            return; // A plain publication, not a request.
+        }
+        DecisionRequest request = DecisionRequest.parse(message);
+        CompletionStage<Decision> decision = handler.decide(request);
+        Objects.requireNonNull(decision, "decision handler returned null");
+        decision.whenComplete((answer, error) -> {
+            if (error != null || answer == null) {
+                LOGGER.log(System.Logger.Level.WARNING, "no decision for " + request.hook() + " of "
+                        + request.name() + " on " + message.subject() + "; Rift applies its timeout policy", error);
+                return;
+            }
+            byte[] payload = answer.toJson().getBytes(StandardCharsets.UTF_8);
+            try {
+                // Publishing waits for the broker, so keep it off the caller's thread.
+                asyncExecutor.execute(() -> {
+                    try {
+                        publish(reply, payload);
+                    } catch (IOException e) {
+                        LOGGER.log(System.Logger.Level.WARNING, "could not reply to a decision on "
+                                + message.subject(), e);
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                // The client closed; Rift applies its timeout policy.
+            }
+        });
     }
 
     /**
