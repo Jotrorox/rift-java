@@ -308,6 +308,18 @@ control.transfer("Steve", "lobby");
 control.reload();
 ```
 
+When Rift runs game servers on more hosts with `rift node`, `nodes()` lists
+them with their reachability, labels and capacity:
+
+```java
+for (NodeStatus node : control.nodes()) {
+    System.out.printf("%s %s %d/%d instances%n", node.name(), node.state(), node.instances(), node.maxInstances());
+}
+```
+
+Each entry of `status().managedServers()` carries its `node` (`local` for the
+proxy host); servers on an unreachable node report the state `unknown`.
+
 Refused commands throw `ControlException`. A command that times out may still
 have run, so check `status()` before retrying it. Rift reports operational
 events on `rift.events.*`:

@@ -59,6 +59,39 @@ class ControlParsingTest {
     }
 
     @Test
+    void parsesNodes() {
+        String json = """
+                {"nodes":[{"name":"node1","state":"online","address":"10.0.0.11","labels":["games"],
+                           "memory_mb":32768,"allocated_memory_mb":4096,"instances":2,"max_instances":40,
+                           "running":2,"version":"0.1.0","last_seen_ms":800,"connected_ms":60000},
+                          {"name":"node2","state":"never_connected","address":"10.0.0.12","labels":[],
+                           "memory_mb":null,"allocated_memory_mb":0,"instances":0,"max_instances":128,
+                           "running":null,"version":null,"last_seen_ms":null},
+                          {"name":"node3","state":"draining"}]}
+                """;
+        var nodes = NodeStatus.parseAll(JsonParser.parseString(json));
+        assertEquals(3, nodes.size());
+        NodeStatus first = nodes.get(0);
+        assertTrue(first.online());
+        assertTrue(first.hasLabel("games"));
+        assertEquals(32768, first.memoryMb().orElseThrow());
+        assertEquals(4096, first.allocatedMemoryMb());
+        assertEquals(2, first.instances());
+        assertEquals(40, first.maxInstances());
+        assertEquals("0.1.0", first.version().orElseThrow());
+        assertEquals(java.time.Duration.ofMillis(800), first.lastSeen().orElseThrow());
+        assertEquals(60000, first.raw().get("connected_ms").getAsLong());
+        NodeStatus second = nodes.get(1);
+        assertEquals(NodeStatus.State.NEVER_CONNECTED, second.state());
+        assertFalse(second.online());
+        assertTrue(second.memoryMb().isEmpty());
+        assertTrue(second.version().isEmpty());
+        assertTrue(second.lastSeen().isEmpty());
+        assertEquals(NodeStatus.State.OTHER, nodes.get(2).state());
+        assertTrue(NodeStatus.parseAll(JsonParser.parseString("{}")).isEmpty());
+    }
+
+    @Test
     void parsesSparseStatus() {
         ProxyStatus status = ProxyStatus.parse(JsonParser.parseString("{}").getAsJsonObject());
         assertTrue(status.players().isEmpty());
