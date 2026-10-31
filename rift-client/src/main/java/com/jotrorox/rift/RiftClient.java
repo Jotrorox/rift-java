@@ -260,6 +260,10 @@ public final class RiftClient implements AutoCloseable {
      * Needs subscribe access to {@code subject} and publish access to
      * {@code _INBOX.>}.
      *
+     * <p>The subscription ends with this client. A long-running decider
+     * should use {@link RiftConnection#decide(String, DecisionHandler)},
+     * which answers again after reconnects.
+     *
      * <pre>{@code
      * client.decide("relaxoban.login", request -> bans.activeBan(request.uuid())
      *         .thenApply(ban -> ban.map(b -> Decision.deny(b.message())).orElse(Decision.proceed())));

@@ -3,6 +3,7 @@ package com.jotrorox.rift;
 import com.jotrorox.rift.control.ControlException;
 import com.jotrorox.rift.control.ProxyStatus;
 import com.jotrorox.rift.control.RiftEvents;
+import com.jotrorox.rift.decision.Decision;
 import com.jotrorox.rift.stream.ConsumerConfig;
 import com.jotrorox.rift.stream.Delivery;
 import com.jotrorox.rift.stream.StoredRecord;
@@ -16,9 +17,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -264,6 +267,51 @@ class RiftIntegrationTest {
         assertTrue(subscription.closed().isDone());
         assertThrows(RiftException.class, subscription::next);
         assertThrows(RiftException.class, () -> client.publish("game.closing", "x"));
+    }
+
+    @Test
+    void decidersAnswerAgainAfterRiftRestarts() throws Exception {
+        // A Rift of its own, so restarting it does not disturb the other tests.
+        try (RiftProcess restarting = RiftProcess.start(RiftProcess.binary());
+             RiftConnection decider = RiftConnection.builder(restarting.client(RiftProcess.PAPER_TOKEN)::connect)
+                     .reconnectDelay(Duration.ofMillis(100), Duration.ofMillis(500))
+                     .start()) {
+            RiftConnection.Registration registration = decider.decide("game.decide.login", request ->
+                    CompletableFuture.completedFuture(request.name().equals("Notch")
+                            ? Decision.deny("You are banned")
+                            : Decision.proceed()));
+            assertEquals(RiftClient.DEFAULT_DECIDER_GROUP, registration.queueGroup());
+            RiftClient before = decider.ready().get(10, TimeUnit.SECONDS);
+            eventually(registration::isSubscribed);
+            assertEquals("{\"action\":\"deny\",\"reason\":\"You are banned\"}", askLogin(restarting, "Notch"));
+
+            restarting.restart();
+            eventually(() -> decider.client().filter(client -> client != before).isPresent()
+                    && registration.isSubscribed());
+            assertEquals("{\"action\":\"deny\",\"reason\":\"You are banned\"}", askLogin(restarting, "Notch"));
+            assertEquals("{\"action\":\"continue\"}", askLogin(restarting, "Alex"));
+        }
+    }
+
+    /** Sends the request Rift sends for a {@code login} decision and returns the decider's answer. */
+    private static String askLogin(RiftProcess rift, String name) throws Exception {
+        String request = """
+                {"hook":"login","uuid":"069a79f444e94726a5befca90e38aaf5","name":"%s",
+                 "connection_id":"7","peer_ip":"203.0.113.4","hostname":"play.example","protocol":772,
+                 "default_server":"lobby","server":null,"target":null,"reason":null}""".formatted(name);
+        try (RiftClient proxy = rift.client(RiftProcess.PAPER_TOKEN).connect()) {
+            return proxy.request("game.decide.login", request, WAIT).payloadAsString();
+        }
+    }
+
+    private static void eventually(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("condition not reached in time");
+            }
+            Thread.sleep(20);
+        }
     }
 
     private static java.security.cert.X509Certificate otherCertificate() throws Exception {

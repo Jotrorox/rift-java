@@ -6,6 +6,7 @@ import com.jotrorox.rift.RiftClient;
 import com.jotrorox.rift.RiftConnection;
 import com.jotrorox.rift.RiftException;
 import com.jotrorox.rift.control.RiftControl;
+import com.jotrorox.rift.decision.DecisionHandler;
 import com.jotrorox.rift.paper.bungee.BungeeChannel;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.event.EventHandler;
@@ -150,6 +151,25 @@ public final class RiftPaper implements AutoCloseable {
     /** Like {@link #subscribe(String, MessageHandler)}, sharing messages within a queue group. */
     public RiftConnection.Registration subscribe(String pattern, String queueGroup, MessageHandler handler) {
         return connection.subscribe(pattern, queueGroup, handler);
+    }
+
+    /**
+     * Answers the decisions Rift sends on {@code subject} for the plugin's
+     * lifetime, restoring the decider after reconnects. Unlike subscription
+     * handlers, the decision handler runs on the subscription's delivery
+     * thread, not the server thread: return quickly and complete the stage
+     * from your own executor.
+     *
+     * <p>Rift waits for an answer before letting a player in, so prefer a
+     * decider that runs independently of game servers Rift starts on demand.
+     */
+    public RiftConnection.Registration decide(String subject, DecisionHandler handler) {
+        return connection.decide(subject, handler);
+    }
+
+    /** Like {@link #decide(String, DecisionHandler)} within {@code queueGroup}, or alone with {@code null}. */
+    public RiftConnection.Registration decide(String subject, String queueGroup, DecisionHandler handler) {
+        return connection.decide(subject, queueGroup, handler);
     }
 
     /** Publishes off the server thread; the future fails while Rift is unreachable. */
