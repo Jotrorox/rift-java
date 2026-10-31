@@ -193,7 +193,8 @@ public class BungeeMessenger<P> {
      *
      * <p>The answer is cached for the lifetime of this messenger, and concurrent
      * calls share one request. It fails with {@link NoCarrierException} while no
-     * player is online; failures are not cached.
+     * player can carry the request, for example right after the first player
+     * joins; failures are not cached, so call it again later.
      */
     public CompletableFuture<Boolean> isRift() {
         while (true) {

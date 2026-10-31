@@ -146,8 +146,10 @@ bungee.forward(BungeeChannel.ALL, "MyChat", "hello".getBytes(UTF_8));
 bungee.onForward("MyChat", (carrier, data) -> getLogger().info(new String(data, UTF_8)));
 ```
 
-Plugin messages need an online player to carry them. Without one, queries fail
-with `NoCarrierException`. Rift sends no reply for unknown players or servers,
+Plugin messages need an online player to carry them, and Paper drops them until
+Rift has registered the channel on that player's connection, which happens just
+after `PlayerJoinEvent`. Without such a player, queries fail with
+`NoCarrierException`; when reacting to a join, delay the query by a tick or two. Rift sends no reply for unknown players or servers,
 so those queries fail with a `TimeoutException` after five seconds (change it
 with `bungee.timeout(...)`). Replies arrive on the server thread.
 

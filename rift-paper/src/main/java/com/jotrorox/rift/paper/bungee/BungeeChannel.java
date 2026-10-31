@@ -6,6 +6,7 @@ import org.bukkit.plugin.messaging.Messenger;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Typed access to the {@code BungeeCord} plugin channel on Paper. Rift answers
@@ -19,9 +20,18 @@ import java.util.Optional;
  *       .thenAccept(count -> player.sendMessage(count + " players online"));
  * }</pre>
  *
+ * <p>Plugin messages travel over a player's connection, and Paper drops them
+ * until the proxy has registered the channel on it, which Rift does once the
+ * player enters play, after {@code PlayerJoinEvent}. Requests without an
+ * explicit player therefore only use players whose connection listens on the
+ * channel, and fail with {@link NoCarrierException} while there is none.
+ *
  * <p>Replies arrive on the server thread, so futures complete there.
  */
 public final class BungeeChannel extends BungeeMessenger<Player> implements PluginMessageListener, AutoCloseable {
+    /** The name Paper stores for {@link #CHANNEL} in a player's listening channels. */
+    private static final String NAMESPACED_CHANNEL = "bungeecord:main";
+
     private final Plugin plugin;
 
     private BungeeChannel(Plugin plugin) {
@@ -54,11 +64,21 @@ public final class BungeeChannel extends BungeeMessenger<Player> implements Plug
         cancelAll();
     }
 
+    /**
+     * Whether a connection listening on {@code channels} accepts {@code BungeeCord}
+     * plugin messages. Paper stores the channel under its namespaced name.
+     */
+    static boolean canCarry(Set<String> channels) {
+        return channels.contains(CHANNEL) || channels.contains(NAMESPACED_CHANNEL);
+    }
+
     private record PaperCarriers(Plugin plugin) implements Carriers<Player> {
         @Override
         public Optional<Player> any() {
             for (Player player : plugin.getServer().getOnlinePlayers()) {
-                return Optional.of(player);
+                if (canCarry(player.getListeningPluginChannels())) {
+                    return Optional.of(player);
+                }
             }
             return Optional.empty();
         }
