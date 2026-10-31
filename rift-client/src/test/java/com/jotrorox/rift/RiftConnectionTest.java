@@ -1,11 +1,13 @@
 package com.jotrorox.rift;
 
+import com.jotrorox.rift.decision.Decision;
 import com.jotrorox.rift.testing.FakeRift;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -128,6 +130,53 @@ class RiftConnectionTest {
             assertEquals("main-thread", threads.poll(5, TimeUnit.SECONDS));
         } finally {
             main.shutdownNow();
+        }
+    }
+
+    @Test
+    void decidersAnswerAgainAfterReconnecting() throws Exception {
+        FakeRift rift = new FakeRift();
+        ExecutorService main = Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "main-thread"));
+        LinkedBlockingQueue<String> threads = new LinkedBlockingQueue<>();
+        String login = """
+                {"hook":"login","uuid":"069a79f444e94726a5befca90e38aaf5","name":"Notch",
+                 "connection_id":"7","peer_ip":"203.0.113.4","hostname":"play.example","protocol":772}""";
+        try (RiftConnection connection = builder(rift).callbackExecutor(main).start();
+             RiftClient proxy = rift.connect()) {
+            RiftConnection.Registration registration = connection.decide("relaxoban.login", request -> {
+                threads.add(Thread.currentThread().getName());
+                return CompletableFuture.completedFuture(Decision.deny("Banned " + request.name()));
+            });
+            assertEquals(RiftClient.DEFAULT_DECIDER_GROUP, registration.queueGroup());
+            connection.ready().get(5, TimeUnit.SECONDS);
+            eventually(registration::isSubscribed);
+            assertEquals("{\"action\":\"deny\",\"reason\":\"Banned Notch\"}",
+                    proxy.request("relaxoban.login", login, Duration.ofSeconds(2)).payloadAsString());
+            // Decisions skip the callback executor, so a busy game thread does not delay logins.
+            assertFalse(threads.take().equals("main-thread"));
+
+            RiftClient before = connection.requireClient();
+            rift.disconnectAll();
+            eventually(() -> connection.client().filter(client -> client != before).isPresent()
+                    && registration.isSubscribed());
+            try (RiftClient after = rift.connect()) {
+                assertEquals("{\"action\":\"deny\",\"reason\":\"Banned Notch\"}",
+                        after.request("relaxoban.login", login, Duration.ofSeconds(2)).payloadAsString());
+            }
+            assertEquals(1, rift.subscriptions("relaxoban.login"));
+
+            registration.close();
+            eventually(() -> rift.subscriptions("relaxoban.login") == 0);
+        } finally {
+            main.shutdownNow();
+        }
+    }
+
+    @Test
+    void decidersNeedLiteralSubjects() {
+        try (RiftConnection connection = builder(new FakeRift()).start()) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> connection.decide("relaxoban.*", request -> null));
         }
     }
 

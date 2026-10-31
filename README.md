@@ -255,21 +255,28 @@ A request without responders fails with `RiftRejectedException`.
 Rift can ask a JVM service whether a player may log in, which server they start
 on and whether a transfer may go ahead. Configure the hook in Rift's
 [`extensions.decisions`](https://jotrorox.github.io/rift/docs/extensions/#decisions-answered-over-the-message-bus),
-then answer it with `decide`:
+then answer it with `decide` on a `RiftConnection` (or `RiftPaper`):
 
 ```java
-client.decide("relaxoban.login", request -> bans.activeBan(request.uuid())
+RiftConnection rift = RiftConnection.start(builder::connect);
+rift.decide("relaxoban.login", request -> bans.activeBan(request.uuid())
         .thenApply(ban -> ban.map(b -> Decision.deny(b.message())).orElse(Decision.proceed())));
 ```
+
+The decider is subscribed again after every reconnect. `RiftClient.decide`
+exists too, but it stops answering when that one connection ends. Rift then
+applies `on_no_responders` to every login until the decider restarts, so use it
+only where something else handles reconnects.
 
 The handler gets a `DecisionRequest` (hook, UUID, name, IP, hostname, current
 server, transfer target and reason) and returns a `CompletionStage<Decision>`:
 `Decision.proceed()`, `Decision.deny(reason)` or, for `initial_server` only,
 `Decision.server(name)`. Complete it from your own executor; the handler runs on
-the subscription's delivery thread. `decide` joins the queue group `deciders`,
-so several instances share the load. If the handler fails, no reply is sent and
-Rift applies its timeout policy. Decisions must not have side effects: Rift may
-have timed out and moved on while the request was still being processed.
+the subscription's delivery thread, even with a callback executor or on Paper.
+`decide` joins the queue group `deciders`, so several instances share the load.
+If the handler fails, no reply is sent and Rift applies its timeout policy.
+Decisions must not have side effects: Rift may have timed out and moved on while
+the request was still being processed.
 
 The decider needs subscribe access to the subject and publish access to
 `_INBOX.>`. Run it independently of the game servers. If it runs only on a

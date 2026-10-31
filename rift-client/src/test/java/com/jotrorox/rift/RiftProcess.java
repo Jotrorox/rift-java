@@ -30,26 +30,20 @@ final class RiftProcess implements AutoCloseable {
     static final String OPERATOR_TOKEN = "operator-token-0123456789abcdefghijklmnopqrs";
     static final String LIMITED_TOKEN = "limited-token-0123456789abcdefghijklmnopqrstu";
 
-    private final Process process;
+    private final Path binary;
     private final Path directory;
     private final ByteArrayOutputStream output = new ByteArrayOutputStream();
+    private final int gamePort;
+    private volatile Process process;
     final int messagingPort;
     final Path certificate;
 
-    private RiftProcess(Process process, Path directory, int messagingPort, Path certificate) {
-        this.process = process;
+    private RiftProcess(Path binary, Path directory, int gamePort, int messagingPort, Path certificate) {
+        this.binary = binary;
         this.directory = directory;
+        this.gamePort = gamePort;
         this.messagingPort = messagingPort;
         this.certificate = certificate;
-        Thread pump = new Thread(() -> {
-            try (InputStream in = process.getInputStream()) {
-                in.transferTo(new SynchronizedSink(output));
-            } catch (IOException ignored) {
-                // Process ended.
-            }
-        }, "rift-output");
-        pump.setDaemon(true);
-        pump.start();
     }
 
     /** The Rift binary to test against, or {@code null} when none is available. */
@@ -124,6 +118,18 @@ final class RiftProcess implements AutoCloseable {
                 """.formatted(gamePort, messagingPort);
         Files.writeString(directory.resolve("rift.lua"), config);
 
+        RiftProcess rift = new RiftProcess(binary, directory, gamePort, messagingPort, certificate);
+        rift.launch();
+        return rift;
+    }
+
+    /** Stops Rift and starts it again on the same ports, dropping every client connection. */
+    void restart() throws Exception {
+        stop();
+        launch();
+    }
+
+    private void launch() throws Exception {
         ProcessBuilder builder = new ProcessBuilder(binary.toString(), "--config", "rift.lua")
                 .directory(directory.toFile())
                 .redirectErrorStream(true);
@@ -131,9 +137,18 @@ final class RiftProcess implements AutoCloseable {
         environment.put("RIFT_TEST_PAPER_TOKEN", PAPER_TOKEN);
         environment.put("RIFT_TEST_OPERATOR_TOKEN", OPERATOR_TOKEN);
         environment.put("RIFT_TEST_LIMITED_TOKEN", LIMITED_TOKEN);
-        RiftProcess rift = new RiftProcess(builder.start(), directory, messagingPort, certificate);
-        rift.awaitReady(gamePort);
-        return rift;
+        Process started = builder.start();
+        process = started;
+        Thread pump = new Thread(() -> {
+            try (InputStream in = started.getInputStream()) {
+                in.transferTo(new SynchronizedSink(output));
+            } catch (IOException ignored) {
+                // Process ended.
+            }
+        }, "rift-output");
+        pump.setDaemon(true);
+        pump.start();
+        awaitReady();
     }
 
     RiftClient.Builder client(String token) throws IOException {
@@ -151,7 +166,7 @@ final class RiftProcess implements AutoCloseable {
         }
     }
 
-    private void awaitReady(int gamePort) throws Exception {
+    private void awaitReady() throws Exception {
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
             if (!process.isAlive()) {
@@ -197,17 +212,22 @@ final class RiftProcess implements AutoCloseable {
         }
     }
 
-    @Override
-    public void close() throws IOException {
-        process.destroy();
+    private void stop() {
+        Process running = process;
+        running.destroy();
         try {
-            if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
-                process.destroyForcibly();
+            if (!running.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                running.destroyForcibly().waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
             }
         } catch (InterruptedException e) {
-            process.destroyForcibly();
+            running.destroyForcibly();
             Thread.currentThread().interrupt();
         }
+    }
+
+    @Override
+    public void close() throws IOException {
+        stop();
         try (var files = Files.walk(directory)) {
             files.sorted(java.util.Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
         }

@@ -1,6 +1,7 @@
 package com.jotrorox.rift;
 
 import com.jotrorox.rift.control.RiftControl;
+import com.jotrorox.rift.decision.DecisionHandler;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -125,7 +126,38 @@ public final class RiftConnection implements AutoCloseable {
     public Registration subscribe(String pattern, String queueGroup, MessageHandler handler) {
         Subjects.requirePattern(pattern);
         Objects.requireNonNull(handler, "handler");
-        Registration registration = new Registration(pattern, queueGroup, handler);
+        return register(new Registration(pattern, queueGroup, handler, null));
+    }
+
+    /**
+     * Answers the decisions Rift sends on {@code subject} now and again after
+     * every reconnect, joining the queue group
+     * {@value RiftClient#DEFAULT_DECIDER_GROUP}. Use this rather than
+     * {@link RiftClient#decide(String, DecisionHandler)} for a long-running
+     * decider: a decider on a bare client stops answering when its connection
+     * drops, and Rift then applies {@code on_no_responders} to every login
+     * until the decider is restarted.
+     *
+     * <p>The handler runs on the subscription's delivery thread, not on the
+     * callback executor, so a busy game thread does not delay logins.
+     *
+     * @return the registration; close it to stop answering
+     */
+    public Registration decide(String subject, DecisionHandler handler) {
+        return decide(subject, RiftClient.DEFAULT_DECIDER_GROUP, handler);
+    }
+
+    /**
+     * Like {@link #decide(String, DecisionHandler)} within {@code queueGroup},
+     * or as the only decider with {@code null}.
+     */
+    public Registration decide(String subject, String queueGroup, DecisionHandler handler) {
+        Subjects.requireLiteral(subject);
+        Objects.requireNonNull(handler, "handler");
+        return register(new Registration(subject, queueGroup, null, handler));
+    }
+
+    private Registration register(Registration registration) {
         registrations.add(registration);
         if (closed) {
             registration.close();
@@ -247,22 +279,33 @@ public final class RiftConnection implements AutoCloseable {
         }
     }
 
-    /** A subscription that is restored after reconnects. Close it to unsubscribe. */
+    /**
+     * A subscription or decider that is restored after reconnects. Close it to
+     * unsubscribe.
+     */
     public final class Registration implements AutoCloseable {
         private final String pattern;
         private final String queueGroup;
         private final MessageHandler handler;
+        private final DecisionHandler decider;
         private volatile Subscription subscription;
         private volatile boolean active = true;
 
-        private Registration(String pattern, String queueGroup, MessageHandler handler) {
+        /** Exactly one of {@code handler} and {@code decider} is set. */
+        private Registration(String pattern, String queueGroup, MessageHandler handler, DecisionHandler decider) {
             this.pattern = pattern;
             this.queueGroup = queueGroup;
             this.handler = handler;
+            this.decider = decider;
         }
 
         public String pattern() {
             return pattern;
+        }
+
+        /** The queue group, or {@code null} when every matching subscription receives a copy. */
+        public String queueGroup() {
+            return queueGroup;
         }
 
         /** Whether messages are currently being received. */
@@ -276,7 +319,9 @@ public final class RiftConnection implements AutoCloseable {
                 return;
             }
             try {
-                Subscription created = client.subscribe(pattern, queueGroup, this::deliver);
+                Subscription created = decider != null
+                        ? client.decide(pattern, queueGroup, decider)
+                        : client.subscribe(pattern, queueGroup, this::deliver);
                 subscription = created;
                 if (!active) {
                     created.close();

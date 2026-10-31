@@ -3,7 +3,8 @@ package com.jotrorox.rift.decision;
 import java.util.concurrent.CompletionStage;
 
 /**
- * Decides logins or transfers for {@link com.jotrorox.rift.RiftClient#decide}.
+ * Decides logins or transfers for {@link com.jotrorox.rift.RiftConnection#decide}
+ * or {@link com.jotrorox.rift.RiftClient#decide}.
  *
  * <p>Return quickly and complete the stage from your own executor, for example
  * a database pool. The handler runs on the subscription's delivery thread, so
