@@ -33,7 +33,9 @@ public final class FakeRift {
     private final Map<String, List<Message>> streams = new ConcurrentHashMap<>();
     private final Map<String, Long> consumers = new ConcurrentHashMap<>();
     private final AtomicLong inboxes = new AtomicLong();
+    private final List<MemoryTransport> transports = new CopyOnWriteArrayList<>();
     private volatile boolean silent;
+    private volatile boolean offline;
 
     /** Rejects publications and subscriptions to subjects starting with {@code prefix}. */
     public FakeRift deny(String prefix) {
@@ -65,39 +67,63 @@ public final class FakeRift {
         return RiftClient.over(transport(), TOKEN, operationTimeout);
     }
 
-    public MemoryTransport transport() {
-        return new MemoryTransport(this::serve);
+    public MemoryTransport transport() throws IOException {
+        if (offline) {
+            throw new IOException("connection refused");
+        }
+        MemoryTransport transport = new MemoryTransport(this::serve);
+        transports.add(transport);
+        return transport;
+    }
+
+    /** While offline, new connections are refused. */
+    public void offline(boolean offline) {
+        this.offline = offline;
+    }
+
+    /** Drops every open connection, like a Rift restart. */
+    public void disconnectAll() {
+        for (MemoryTransport transport : transports) {
+            transport.close();
+        }
+        transports.clear();
+    }
+
+    /** Number of live subscriptions whose pattern equals {@code pattern}. */
+    public long subscriptions(String pattern) {
+        return subscribers.stream().filter(subscriber -> subscriber.pattern.equals(pattern)
+                && subscriber.out != null).count();
     }
 
     private void serve(MemoryTransport.ServerSide side) {
         boolean first = true;
-            while (true) {
-                Frame frame;
-                try {
-                    frame = Frames.read(side.input());
-                } catch (IOException e) {
-                    return;
-                }
-                if (silent) {
-                    continue;
-                }
-                try {
-                    if (!handle(frame, side, first)) {
-                        side.finish();
-                        return;
-                    }
-                } catch (Denied e) {
-                    error(side.output(), Protocol.ERROR_PERMISSION, e.getMessage());
+        while (true) {
+            Frame frame;
+            try {
+                frame = Frames.read(side.input());
+            } catch (IOException e) {
+                return;
+            }
+            if (silent) {
+                continue;
+            }
+            try {
+                if (!handle(frame, side, first)) {
                     side.finish();
-                    side.fromClient().reset();
-                    return;
-                } catch (IOException | IllegalArgumentException e) {
-                    error(side.output(), Protocol.ERROR_OPERATION, e.getMessage());
-                    side.finish();
-                    side.fromClient().reset();
                     return;
                 }
-                first = false;
+            } catch (Denied e) {
+                error(side.output(), Protocol.ERROR_PERMISSION, e.getMessage());
+                side.finish();
+                side.fromClient().reset();
+                return;
+            } catch (IOException | IllegalArgumentException e) {
+                error(side.output(), Protocol.ERROR_OPERATION, e.getMessage());
+                side.finish();
+                side.fromClient().reset();
+                return;
+            }
+            first = false;
         }
     }
 
