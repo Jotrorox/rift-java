@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Paper 26.x requires Java 25; rift-paper targets the 1.21 line on Java 21.
+      - dependency-name: io.papermc.paper:paper-api
+        versions: ['>=26']
     groups:
       gradle-dependencies:
         patterns: ['*']
