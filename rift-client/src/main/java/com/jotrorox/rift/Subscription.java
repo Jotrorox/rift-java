@@ -133,9 +133,12 @@ public final class Subscription implements AutoCloseable {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        } catch (IOException e) {
+        } catch (RiftException e) {
             channel.abort();
             finish(e);
+        } catch (IOException e) {
+            channel.abort();
+            finish(new RiftException("subscription stream to Rift closed: " + e.getMessage(), e));
         }
     }
 
